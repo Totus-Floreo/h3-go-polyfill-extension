@@ -3,36 +3,68 @@ package app
 import (
 	"context"
 	"fmt"
-	"github.com/Totus-Floreo/h3-go"
+	"github.com/Totus-Floreo/h3-go-polyfill-extension/pkg/util"
+	"log/slog"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/twpayne/go-geom"
-	"github.com/twpayne/go-geom/encoding/geojson"
-	"os"
+	"github.com/twpayne/go-geom/encoding/wkb"
+	"github.com/uber/h3-go/v4"
 )
 
-func Polyfill() {
-	var geometry geom.T
-	if err := geojson.Unmarshal([]byte(GeoJSON), &geometry); err != nil {
-		fmt.Println(err)
-		return
+func connectDB(ctx context.Context, dbConnStr string, logger *slog.Logger) (*pgx.Conn, error) {
+	conn, err := pgx.Connect(ctx, dbConnStr)
+	if err != nil {
+		logger.Error("Unable to connect to database", slog.Any("err", err))
+		return nil, err
+	}
+
+	if err := conn.Ping(ctx); err != nil {
+		logger.Error("Unable to ping database", slog.Any("err", err))
+		conn.Close(ctx)
+		return nil, err
+	}
+
+	logger.Info("Connected to database")
+
+	return conn, nil
+}
+
+func getMultipolygon(ctx context.Context, conn *pgx.Conn, outlineTable string, logger *slog.Logger) (*geom.MultiPolygon, error) {
+	var outlineWKB []byte
+
+	query := fmt.Sprintf("SELECT ST_AsBinary(geometry) FROM %s LIMIT 1", outlineTable)
+	err := conn.QueryRow(ctx, query).Scan(&outlineWKB)
+	if err != nil {
+		logger.Error("Unable to get outline geometry", slog.Any("err", err))
+		return nil, err
+	}
+
+	geometry, err := wkb.Unmarshal(outlineWKB)
+	if err != nil {
+		logger.Error("Unable to unmarshal WKB", slog.Any("err", err))
+		return nil, err
 	}
 
 	multipolygon, ok := geometry.(*geom.MultiPolygon)
 	if !ok {
-		fmt.Println("not a multipolygon")
-		return
+		logger.Error("Geometry is not a multipolygon")
+		return nil, fmt.Errorf("not a multipolygon")
 	}
 
-	fmt.Println("multipolygon have a ", multipolygon.NumPolygons(), " polygons")
+	logger.Info("Multipolygon loaded", slog.Int("num_polygons", multipolygon.NumPolygons()))
+	return multipolygon, nil
+}
 
+func multipolygonToH3(multipolygon *geom.MultiPolygon, logger *slog.Logger) (h3.GeoPolygon, error) {
 	h3Loop := make([]h3.LatLng, 0)
 	h3HolesLoop := make([]h3.GeoLoop, 0)
-
 	mainpolygon := multipolygon.Polygon(0)
-	fmt.Println("main polygon have a ", mainpolygon.NumLinearRings(), " rings")
+
+	logger.Info("Main polygon info", slog.Int("num_rings", mainpolygon.NumLinearRings()))
 	for j := 0; j < mainpolygon.NumLinearRings(); j++ {
 		linearRing := mainpolygon.LinearRing(j)
-		fmt.Println("linearRing ", j, " have a ", linearRing.NumCoords(), " coords")
+		logger.Info("Main polygon ring info", slog.Int("ring_index", j), slog.Int("num_coords", linearRing.NumCoords()))
 		for n := 0; n < linearRing.NumCoords(); n++ {
 			crd := linearRing.Coord(n)
 			h3Loop = append(h3Loop, h3.NewLatLng(crd.Y(), crd.X()))
@@ -41,82 +73,87 @@ func Polyfill() {
 
 	for i := 1; i < multipolygon.NumPolygons(); i++ {
 		polygon := multipolygon.Polygon(i)
-		fmt.Println("polygon ", i, " have a ", polygon.NumLinearRings(), " rings")
+		logger.Info("Polygon info", slog.Int("polygon_index", i), slog.Int("num_rings", polygon.NumLinearRings()))
 		for j := 0; j < polygon.NumLinearRings(); j++ {
 			linearRing := polygon.LinearRing(j)
-			fmt.Println("linearRing ", j, " have a ", linearRing.NumCoords(), " coords")
-			h3Loop := make([]h3.LatLng, 0)
+			logger.Info("Polygon ring info", slog.Int("polygon_index", i), slog.Int("ring_index", j), slog.Int("num_coords", linearRing.NumCoords()))
+			holeLoop := make([]h3.LatLng, 0)
 			for n := 0; n < linearRing.NumCoords(); n++ {
 				crd := linearRing.Coord(n)
-				h3Loop = append(h3Loop, h3.NewLatLng(crd.Y(), crd.X()))
+				holeLoop = append(holeLoop, h3.NewLatLng(crd.Y(), crd.X()))
 			}
-			h3HolesLoop = append(h3HolesLoop, h3Loop)
+			h3HolesLoop = append(h3HolesLoop, holeLoop)
 		}
 	}
 
-	ctx := context.Background()
-	fmt.Println(IsUserAuthorized(ctx))
-	ctx := context.WithValue(ctx, "TEST", "admin")
-
-	h3polygon := h3.GeoPolygon{GeoLoop: h3Loop, Holes: h3HolesLoop}
-
-	cells := h3.PolygonToCellsExperimental(h3polygon, h3.PolyfillModeOverlapping, 7)
-	fmt.Println("Amount of cells : ", len(cells))
-
-	conn, err := pgx.Connect(context.Background(), "postgres://postgres:qwerty@localhost:5442/taxinet")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close(context.Background())
-
-	if err := conn.Ping(context.Background()); err != nil {
-		return
-	} else {
-		fmt.Println("Connected to database")
-	}
-
-	fmt.Println("Amount of cells : ", len(cells))
-
-	for _, cell := range cells {
-
-		wktCell := h3ToWKT(cell)
-
-		fmt.Println(cell.Boundary())
-		fmt.Println("WKT Cell :", wktCell)
-
-		_, err = conn.Exec(context.Background(), "INSERT INTO surges(h3_idx, resolution, geometry) VALUES ($1, $2, st_setsrid(st_wkttosql($3), 4326))", cell.String(), cell.Resolution(), wktCell)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Unable to insert to database: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	fmt.Println("Polyfill done")
+	return h3.GeoPolygon{GeoLoop: h3Loop, Holes: h3HolesLoop}, nil
 }
 
-func h3ToWKT(cell h3.Cell) string {
-	boundary := cell.Boundary()
+func insertCells(ctx context.Context, conn *pgx.Conn, cells []h3.Cell, targetTable, outlineTable string, logger *slog.Logger) error {
+	for _, cell := range cells {
+		wktCell := util.H3ToWKT(cell)
+		boundary, err := cell.Boundary()
+		if err != nil {
+			logger.Error("Error getting cell boundary", slog.Any("err", err))
+			continue
+		}
 
-	// Начинаем с "POLYGON(("
-	wkt := "POLYGON(("
+		logger.Debug("Cell boundary", slog.Any("boundary", boundary))
+		logger.Debug("WKT Cell", slog.String("wkt", wktCell))
 
-	// Добавляем все координаты
-	for i, crd := range boundary {
-		// Добавляем координаты в формате "долгота широта"
-		wkt += fmt.Sprintf("%f %f", crd.Lng, crd.Lat)
-
-		// Если это не последняя координата, добавляем запятую
-		if i != len(boundary)-1 {
-			wkt += ", "
+		insertQuery := fmt.Sprintf(`
+			INSERT INTO %s(h3_idx, resolution, geometry)
+			SELECT $1, $2, ST_Intersection(
+				st_setsrid(st_wkttosql($3), 4326),
+				(SELECT geometry FROM %s LIMIT 1)
+			)
+			WHERE ST_Intersects(
+				st_setsrid(st_wkttosql($3), 4326),
+				(SELECT geometry FROM %s LIMIT 1)
+			)
+		`, targetTable, outlineTable, outlineTable)
+		_, err = conn.Exec(ctx, insertQuery, cell.String(), cell.Resolution(), wktCell)
+		if err != nil {
+			logger.Error("Unable to insert to database", slog.Any("err", err))
+			return err
 		}
 	}
+	return nil
+}
 
-	// Добавляем первую координату в конец, чтобы закрыть кольцо
-	wkt += fmt.Sprintf(", %f %f", boundary[0].Lng, boundary[0].Lat)
+// Polyfill теперь принимает параметры
+func Polyfill(targetTable, outlineTable, dbConnStr string) {
+	ctx := context.Background()
+	logger := slog.Default()
 
-	// Закрываем скобки
-	wkt += "))"
+	conn, err := connectDB(ctx, dbConnStr, logger)
+	if err != nil {
+		return
+	}
+	defer conn.Close(ctx)
 
-	return wkt
+	multipolygon, err := getMultipolygon(ctx, conn, outlineTable, logger)
+	if err != nil {
+		return
+	}
+
+	h3polygon, err := multipolygonToH3(multipolygon, logger)
+	if err != nil {
+		logger.Error("Failed to convert multipolygon to H3", slog.Any("err", err))
+		return
+	}
+
+	cells, err := h3.PolygonToCellsExperimental(h3polygon, 7, h3.ContainmentOverlappingBbox)
+	if err != nil {
+		logger.Error("Error during polygon to cells conversion", slog.Any("err", err))
+		return
+	}
+	logger.Info("Polygon to cells conversion done", slog.Int("num_cells", len(cells)))
+
+	if err := insertCells(ctx, conn, cells, targetTable, outlineTable, logger); err != nil {
+		logger.Error("Error inserting cells", slog.Any("err", err))
+		return
+	}
+
+	logger.Info("Polyfill done")
 }

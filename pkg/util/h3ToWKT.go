@@ -2,11 +2,11 @@ package util
 
 import (
 	"fmt"
-	"github.com/Totus-Floreo/h3-go"
+	"github.com/uber/h3-go/v4"
 )
 
 func H3ToWKT(cell h3.Cell) string {
-	boundary := cell.Boundary()
+	boundary, _ := cell.Boundary()
 
 	// Начинаем с "POLYGON(("
 	wkt := "POLYGON(("
