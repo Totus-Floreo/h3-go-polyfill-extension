@@ -5,8 +5,11 @@ import (
 	"github.com/uber/h3-go/v4"
 )
 
-func H3ToWKT(cell h3.Cell) string {
-	boundary, _ := cell.Boundary()
+func H3ToWKT(cell h3.Cell) (string, error) {
+	boundary, err := cell.Boundary()
+	if err != nil {
+		return "", err
+	}
 
 	// Начинаем с "POLYGON(("
 	wkt := "POLYGON(("
@@ -28,5 +31,5 @@ func H3ToWKT(cell h3.Cell) string {
 	// Закрываем скобки
 	wkt += "))"
 
-	return wkt
+	return wkt, nil
 }

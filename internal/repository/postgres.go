@@ -19,7 +19,14 @@ type PostgresRepository struct {
 }
 
 func NewPostgresRepository(ctx context.Context, logger logging.DBlogger, env env.Env) (domain.Repository, error) {
-	conn, err := pgx.Connect(ctx, env.DbConnStr())
+	config, err := pgx.ParseConfig(env.DbConnStr())
+	if err != nil {
+		logger.Error("Unable to parse database connection string", slog.Any("err", err))
+		return nil, err
+	}
+	config.Tracer = logging.NewTraceLog(logger.Logger)
+
+	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
 		logger.Error("Unable to connect to database", slog.Any("err", err))
 		return nil, err
@@ -54,7 +61,12 @@ func (pr *PostgresRepository) Close(ctx context.Context) error {
 
 func (pr *PostgresRepository) InsertCells(ctx context.Context, cells []h3.Cell) error {
 	for _, cell := range cells {
-		wktCell := util.H3ToWKT(cell)
+		wktCell, err := util.H3ToWKT(cell)
+		if err != nil {
+			pr.logger.Error("Error getting cell boundary", slog.Any("err", err))
+			continue
+		}
+
 		boundary, err := cell.Boundary()
 		if err != nil {
 			pr.logger.Error("Error getting cell boundary", slog.Any("err", err))

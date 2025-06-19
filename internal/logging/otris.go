@@ -25,7 +25,7 @@ func NewLogger() Logger {
 func (l Logger) Write(p []byte) (n int, err error) {
 	buffer := bytes.NewBuffer(p)
 	l.Logger.Info("Event", buffer.String())
-	return
+	return len(p), nil
 }
 
 type DBlogger struct {
