@@ -4,9 +4,14 @@ Copyright © 2024 Timur Kulakov totusfloreodev@proton.me
 package cmd
 
 import (
+	"context"
 	"github.com/Totus-Floreo/h3-go-polyfill-extension/internal/app"
+	"github.com/Totus-Floreo/h3-go-polyfill-extension/internal/env"
+	"github.com/Totus-Floreo/h3-go-polyfill-extension/internal/logging"
+	"github.com/Totus-Floreo/h3-go-polyfill-extension/internal/repository"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+	"log/slog"
 	"os"
 )
 
@@ -66,7 +71,27 @@ to quickly create a Cobra application.`,
 				dbConnStr = cfg.DBConn
 			}
 		}
-		app.Polyfill(targetTable, outlineTable, dbConnStr)
+
+		ctx := context.Background()
+
+		log := logging.NewLogger()
+		slog.SetDefault(log.Logger)
+
+		env := env.NewEnv(targetTable, outlineTable, dbConnStr)
+
+		repository, err := repository.NewPostgresRepository(ctx, logging.DBlogger{Logger: log}, env)
+		if err != nil {
+			log.Error("Ошибка создания репозитория", slog.Any("err", err))
+			os.Exit(1)
+		}
+		defer repository.Close(ctx)
+
+		service := app.NewService(log, repository)
+
+		if err := service.Polyfill(ctx); err != nil {
+			log.Error("Ошибка выполнения полифилла", slog.Any("err", err))
+			os.Exit(1)
+		}
 	},
 }
 
